@@ -40,6 +40,13 @@
 	} while (0)
 #endif
 
+#define f2fs_restart() do { \
+	if (system_state > SYSTEM_RUNNING) \
+		WARN_ON(1); \
+	else \
+		BUG_ON(1); \
+} while (0)
+
 enum {
 	FAULT_KMALLOC,
 	FAULT_KVMALLOC,
@@ -185,11 +192,25 @@ enum {
 
 #define MAX_DISCARD_BLOCKS(sbi)		BLKS_PER_SEC(sbi)
 #define DEF_MAX_DISCARD_REQUEST		8	/* issue 8 discards per round */
-#define DEF_MIN_DISCARD_ISSUE_TIME	50	/* 50 ms, if exists */
-#define DEF_MID_DISCARD_ISSUE_TIME	500	/* 500 ms, if device busy */
-#define DEF_MAX_DISCARD_ISSUE_TIME	60000	/* 60 s, if no candidates */
+//#define DEF_MIN_DISCARD_ISSUE_TIME	50	/* 50 ms, if exists */
+//#define DEF_MID_DISCARD_ISSUE_TIME	500	/* 500 ms, if device busy */
+//#define DEF_MAX_DISCARD_ISSUE_TIME	60000	/* 60 s, if no candidates */
 #define DEF_DISCARD_URGENT_UTIL		80	/* do more discard over 80% */
 #define DEF_CP_INTERVAL			60	/* 60 secs */
+/* VENDOR_EDIT shifei.ge@TECH.Storage.FS
+ * 2019-10-15, add for oDiscard
+ */
+#define DEF_MIN_DISCARD_ISSUE_TIME	100	/* 100 ms, if exists */
+#define DEF_MID_DISCARD_ISSUE_TIME	2000	/* 2 s, if dev is busy */
+#define DEF_MAX_DISCARD_ISSUE_TIME	120000	/* 120 s, if no candidates */
+#define DEF_DISCARD_WAKEUP_INTERVAL	900	/* 900 secs */
+#define DEF_DISCARD_BALANCE_TIME	8000	/* 8000 ms */
+#define DEF_URGENT_DISCARD_ISSUE_TIME	50	/* 50 ms, if force */
+#define DEF_DISCARD_EMPTY_ISSUE_TIME	600000	/* 10 min, undiscard block=0 */
+/* VENDOR_EDIT yanwu@TECH.Storage.FS.oF2FS
+ * 2019/08/12, set default idle interval to 1s
+ */
+#define DEF_GC_IDLE_INTERVAL		1	/* 1 secs */
 #define DEF_IDLE_INTERVAL		5	/* 5 secs */
 #define DEF_DISABLE_INTERVAL		5	/* 5 secs */
 #define DEF_DISABLE_QUICK_INTERVAL	1	/* 1 secs */
@@ -292,6 +313,9 @@ struct discard_cmd {
 	int error;			/* bio error */
 	spinlock_t lock;		/* for state/bio_ref updating */
 	unsigned short bio_ref;		/* bio reference count */
+#ifdef CONFIG_F2FS_BD_STAT
+	u64 discard_time;
+#endif
 };
 
 enum {
@@ -299,6 +323,11 @@ enum {
 	DPOLICY_FORCE,
 	DPOLICY_FSTRIM,
 	DPOLICY_UMOUNT,
+	/* VENDOR_EDIT huangjianan@TECH.Storage.FS
+	 * 2020-1-14, add for oDiscard decoupling
+	 */
+	DPOLICY_BALANCE,
+	DPOLICY_PERFORMANCE,
 	MAX_DPOLICY,
 };
 
@@ -314,6 +343,10 @@ struct discard_policy {
 	bool ordered;			/* issue discard by lba order */
 	unsigned int granularity;	/* discard granularity */
 	int timeout;			/* discard timeout for put_super */
+	/* VENDOR_EDIT shifei.ge@TECH.Storage.FS
+	 * 2019-10-15, add for oDiscard
+	 */
+	bool io_busy;			/* interrupt by user io */
 };
 
 struct discard_cmd_control {
@@ -1263,6 +1296,7 @@ struct f2fs_sb_info {
 	unsigned int gc_mode;			/* current GC state */
 	unsigned int next_victim_seg[2];	/* next segment in victim section */
 	/* for skip statistic */
+	unsigned int atomic_files;              /* # of opened atomic file */
 	unsigned long long skipped_atomic_files[2];	/* FG_GC and BG_GC */
 	unsigned long long skipped_gc_rwsem;		/* FG_GC only */
 
@@ -1301,6 +1335,10 @@ struct f2fs_sb_info {
 	unsigned int ndirty_inode[NR_INODE_TYPE];	/* # of dirty inodes */
 #endif
 	spinlock_t stat_lock;			/* lock for stat operations */
+#ifdef CONFIG_F2FS_BD_STAT
+	spinlock_t bd_lock;
+	struct f2fs_bigdata_info *bd_info;	/* big data collections */
+#endif
 
 	/* For app/fs IO statistics */
 	spinlock_t iostat_lock;
@@ -1329,6 +1367,23 @@ struct f2fs_sb_info {
 
 	/* Precomputed FS UUID checksum for seeding other checksums */
 	__u32 s_chksum_seed;
+	/* VENDOR_EDIT yanwu@TECH.Storage.FS.oF2FS
+	 * 2019/08/13, add code to optimize gc
+	 * 2019/08/14, add need_SSR GC
+	 */
+	bool is_frag;				/* urgent gc flag */
+	unsigned long last_frag_check;		/* last urgent check jiffies */
+	atomic_t need_ssr_gc;			/* ssr gc count */
+	/* VENDOR_EDIT yanwu@TECH.Storage.FS.oF2FS
+	 * 2019/10/15, control of2fs gc code, will remove
+	 */
+	bool gc_opt_enable;
+	/* VENDOR_EDIT huangjianan@TECH.Storage.FS
+	* 2020-1-14, add for oDiscard decoupling
+	*/
+	bool dc_opt_enable;
+	int dpolicy_expect;
+	bool fsync_protect;
 };
 
 struct f2fs_private_dio {
@@ -1367,6 +1422,17 @@ static inline bool time_to_inject(struct f2fs_sb_info *sbi, int type)
 	return false;
 }
 #endif
+
+/*
+ * Test if the mounted volume is a multi-device volume.
+ *   - For a single regular disk volume, sbi->s_ndevs is 0.
+ *   - For a single zoned disk volume, sbi->s_ndevs is 1.
+ *   - For a multi-device volume, sbi->s_ndevs is always 2 or more.
+ */
+static inline bool f2fs_is_multi_device(struct f2fs_sb_info *sbi)
+{
+	return sbi->s_ndevs > 1;
+}
 
 /* For write statistics. Suppose sector size is 512 bytes,
  * and the return value is in kbytes. s is of struct f2fs_sb_info.
@@ -1780,6 +1846,7 @@ enospc:
 	return -ENOSPC;
 }
 
+void f2fs_msg(struct super_block *sb, const char *level, const char *fmt, ...);
 static inline void dec_valid_block_count(struct f2fs_sb_info *sbi,
 						struct inode *inode,
 						block_t count)
@@ -1788,13 +1855,21 @@ static inline void dec_valid_block_count(struct f2fs_sb_info *sbi,
 
 	spin_lock(&sbi->stat_lock);
 	f2fs_bug_on(sbi, sbi->total_valid_block_count < (block_t) count);
-	f2fs_bug_on(sbi, inode->i_blocks < sectors);
 	sbi->total_valid_block_count -= (block_t)count;
 	if (sbi->reserved_blocks &&
 		sbi->current_reserved_blocks < sbi->reserved_blocks)
 		sbi->current_reserved_blocks = min(sbi->reserved_blocks,
 					sbi->current_reserved_blocks + count);
 	spin_unlock(&sbi->stat_lock);
+	if (unlikely(inode->i_blocks < sectors)) {
+		f2fs_msg(sbi->sb, KERN_WARNING,
+			"Inconsistent i_blocks, ino:%lu, iblocks:%llu, sectors:%llu",
+			inode->i_ino,
+			(unsigned long long)inode->i_blocks,
+			(unsigned long long)sectors);
+		set_sbi_flag(sbi, SBI_NEED_FSCK);
+		return;
+	}
 	f2fs_i_blocks_write(inode, count, false, true);
 }
 
@@ -2162,7 +2237,7 @@ static inline bool is_idle(struct f2fs_sb_info *sbi, int type)
 		get_pages(sbi, F2FS_DIO_WRITE))
 		return false;
 
-	if (SM_I(sbi) && SM_I(sbi)->dcc_info &&
+	if (type != DISCARD_TIME && SM_I(sbi) && SM_I(sbi)->dcc_info &&
 			atomic_read(&SM_I(sbi)->dcc_info->queued_discard))
 		return false;
 
@@ -2808,7 +2883,6 @@ static inline void f2fs_update_iostat(struct f2fs_sb_info *sbi,
 
 bool f2fs_is_valid_blkaddr(struct f2fs_sb_info *sbi,
 					block_t blkaddr, int type);
-void f2fs_msg(struct super_block *sb, const char *level, const char *fmt, ...);
 static inline void verify_blkaddr(struct f2fs_sb_info *sbi,
 					block_t blkaddr, int type)
 {
@@ -2958,6 +3032,11 @@ int f2fs_sync_fs(struct super_block *sb, int sync);
 extern __printf(3, 4)
 void f2fs_msg(struct super_block *sb, const char *level, const char *fmt, ...);
 int f2fs_sanity_check_ckpt(struct f2fs_sb_info *sbi);
+#if defined(CONFIG_MTK_PLATFORM)
+int sanity_check_ckpt(struct f2fs_sb_info *sbi);
+int f2fs_set_bio_ctx(struct inode *inode, struct bio *bio);
+int f2fs_set_bio_ctx_fio(struct f2fs_io_info *fio, struct bio *bio);
+#endif
 
 /*
  * hash.c
@@ -3094,7 +3173,7 @@ struct page *f2fs_get_meta_page(struct f2fs_sb_info *sbi, pgoff_t index);
 struct page *f2fs_get_meta_page_nofail(struct f2fs_sb_info *sbi, pgoff_t index);
 struct page *f2fs_get_tmp_page(struct f2fs_sb_info *sbi, pgoff_t index);
 bool f2fs_is_valid_blkaddr(struct f2fs_sb_info *sbi,
-			block_t blkaddr, int type);
+					block_t blkaddr, int type);
 int f2fs_ra_meta_pages(struct f2fs_sb_info *sbi, block_t start, int nrpages,
 			int type, bool sync);
 void f2fs_ra_meta_pages_cond(struct f2fs_sb_info *sbi, pgoff_t index);
@@ -3400,6 +3479,12 @@ static inline void __init f2fs_create_root_stats(void) { }
 static inline void f2fs_destroy_root_stats(void) { }
 #endif
 
+#ifdef CONFIG_F2FS_BD_STAT
+#include "of2fs_bigdata.h"
+void f2fs_build_bd_stat(struct f2fs_sb_info *sbi);
+void f2fs_destroy_bd_stat(struct f2fs_sb_info *sbi);
+#endif
+
 extern const struct file_operations f2fs_dir_operations;
 extern const struct file_operations f2fs_file_operations;
 extern const struct inode_operations f2fs_file_inode_operations;
@@ -3493,14 +3578,9 @@ void f2fs_unregister_sysfs(struct f2fs_sb_info *sbi);
 /*
  * crypto support
  */
-static inline bool f2fs_encrypted_inode(struct inode *inode)
-{
-	return file_is_encrypt(inode);
-}
-
 static inline bool f2fs_encrypted_file(struct inode *inode)
 {
-	return f2fs_encrypted_inode(inode) && S_ISREG(inode->i_mode);
+	return IS_ENCRYPTED(inode) && S_ISREG(inode->i_mode);
 }
 
 static inline void f2fs_set_encrypted_inode(struct inode *inode)
@@ -3620,8 +3700,14 @@ static inline bool f2fs_force_buffered_io(struct inode *inode,
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	int rw = iov_iter_rw(iter);
 
+#if defined(CONFIG_MTK_PLATFORM)
+	if (f2fs_post_read_required(inode) && fscrypt_is_sw_encrypt(inode))
+#elif defined(CONFIG_ARCH_MSM) || defined(CONFIG_ARCH_QCOM)
 	if (f2fs_encrypted_file(inode) &&
 	    !fscrypt_using_hardware_encryption(inode))
+#else
+	if (f2fs_post_read_required(inode))
+#endif
 		return true;
 	if (sbi->s_ndevs)
 		return true;
@@ -3640,6 +3726,7 @@ static inline bool f2fs_force_buffered_io(struct inode *inode,
 	return false;
 }
 
+#if defined(CONFIG_ARCH_MSM) || defined(CONFIG_ARCH_QCOM)
 static inline bool f2fs_may_encrypt_bio(struct inode *inode,
 		struct f2fs_io_info *fio)
 {
@@ -3649,6 +3736,7 @@ static inline bool f2fs_may_encrypt_bio(struct inode *inode,
 	return (f2fs_encrypted_file(inode) &&
 			fscrypt_using_hardware_encryption(inode));
 }
+#endif
 
 #ifdef CONFIG_F2FS_FAULT_INJECTION
 extern void f2fs_build_fault_attr(struct f2fs_sb_info *sbi, unsigned int rate,
@@ -3670,4 +3758,31 @@ static inline bool is_journalled_quota(struct f2fs_sb_info *sbi)
 	return false;
 }
 
+/* VENDOR_EDIT shifei.ge@TECH.Storage.FS
+ * 2019-10-15, add for oDiscard
+ */
+#define F2FS_FS_FREE_PERCENT		20
+#define F2FS_DEVICE_FREE_PERCENT	10
+
+/* VENDOR_EDIT huangjianan@TECH.Storage.FS
+ * 2020-1-14, add for oDiscard decoupling
+ */
+static inline bool f2fs_is_space_free(struct f2fs_sb_info *sbi)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	block_t user_blocks = sbi->user_block_count;
+	block_t ovp_cnt = SM_I(sbi)->ovp_segments << sbi->log_blocks_per_seg;
+	block_t avail_block = user_blocks - valid_user_blocks(sbi) + ovp_cnt;
+	block_t fs_threshold = (block_t)(SM_I(sbi)->main_segments *
+			sbi->blocks_per_seg * F2FS_FS_FREE_PERCENT) / 100;
+	block_t device_threshold = (block_t)(SM_I(sbi)->main_segments *
+			sbi->blocks_per_seg * F2FS_DEVICE_FREE_PERCENT) / 100;
+
+	return avail_block > fs_threshold &&
+			avail_block - dcc->undiscard_blks > device_threshold;
+}
+
 #endif
+
+#define EFSBADCRC	EBADMSG		/* Bad CRC detected */
+#define EFSCORRUPTED	EUCLEAN		/* Filesystem is corrupted */

@@ -546,7 +546,15 @@ retry_dn:
 		goto err;
 
 	f2fs_bug_on(sbi, ni.ino != ino_of_node(page));
-	f2fs_bug_on(sbi, ofs_of_node(dn.node_page) != ofs_of_node(page));
+
+	if (ofs_of_node(dn.node_page) != ofs_of_node(page)) {
+		f2fs_msg(sbi->sb, KERN_WARNING,
+			"Inconsistent ofs_of_node, ino:%lu, ofs:%u, %u",
+			inode->i_ino, ofs_of_node(dn.node_page),
+			ofs_of_node(page));
+		err = -EFSCORRUPTED;
+		goto err;
+	}
 
 	for (; start < end; start++, dn.ofs_in_node++) {
 		block_t src, dest;
@@ -650,6 +658,19 @@ static int recover_data(struct f2fs_sb_info *sbi, struct list_head *inode_list,
 			err = PTR_ERR(page);
 			break;
 		}
+
+		if (PageChecked(page)) {
+			f2fs_msg(sbi->sb, KERN_ERR, "Abandon looped node block list");
+			f2fs_put_page(page, 1);
+			err = -EINVAL;
+			break;
+		}
+
+		/*
+		 * it's not needed to clear PG_checked flag in temp page since we
+		 * will truncate all those pages in the end of recovery.
+		 */
+		SetPageChecked(page);
 
 		if (!is_recoverable_dnode(page)) {
 			f2fs_put_page(page, 1);

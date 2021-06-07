@@ -44,7 +44,7 @@ void f2fs_set_inode_flags(struct inode *inode)
 		new_fl |= S_NOATIME;
 	if (flags & F2FS_DIRSYNC_FL)
 		new_fl |= S_DIRSYNC;
-	if (f2fs_encrypted_inode(inode))
+	if (file_is_encrypt(inode))
 		new_fl |= S_ENCRYPTED;
 	inode_set_flags(inode, new_fl,
 			S_SYNC|S_APPEND|S_IMMUTABLE|S_NOATIME|S_DIRSYNC|
@@ -74,7 +74,7 @@ static int __written_first_block(struct f2fs_sb_info *sbi,
 	if (!__is_valid_data_blkaddr(addr))
 		return 1;
 	if (!f2fs_is_valid_blkaddr(sbi, addr, DATA_GENERIC))
-		return -EFAULT;
+		return -EFSCORRUPTED;
 	return 0;
 }
 
@@ -373,7 +373,7 @@ static int do_read_inode(struct inode *inode)
 
 	if (!sanity_check_inode(inode, node_page)) {
 		f2fs_put_page(node_page, 1);
-		return -EINVAL;
+		return -EFSCORRUPTED;
 	}
 
 	/* check data exist */
@@ -468,7 +468,7 @@ make_now:
 		inode->i_mapping->a_ops = &f2fs_dblock_aops;
 		inode_nohighmem(inode);
 	} else if (S_ISLNK(inode->i_mode)) {
-		if (f2fs_encrypted_inode(inode))
+		if (file_is_encrypt(inode))
 			inode->i_op = &f2fs_encrypted_symlink_inode_operations;
 		else
 			inode->i_op = &f2fs_symlink_inode_operations;
@@ -488,6 +488,7 @@ make_now:
 	return inode;
 
 bad_inode:
+	f2fs_inode_synced(inode);
 	iget_failed(inode);
 	trace_f2fs_iget_exit(inode, ret);
 	return ERR_PTR(ret);
@@ -610,6 +611,11 @@ retry:
 			goto retry;
 		} else if (err != -ENOENT) {
 			f2fs_stop_checkpoint(sbi, false);
+			f2fs_msg(sbi->sb, KERN_ERR,
+				 "f2fs inode page read error! erro_num = %d\n", err);
+#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
+			f2fs_restart(); /* force restarting */
+#endif
 		}
 		return;
 	}
@@ -722,8 +728,7 @@ no_delete:
 		f2fs_msg(sbi->sb, KERN_WARNING,
 			 "inconsistent dirty inode:%u entry found during eviction\n",
 			 inode->i_ino);
-		if (!is_set_ckpt_flags(sbi, CP_ERROR_FLAG) &&
-		    !is_sbi_flag_set(sbi, SBI_CP_DISABLED))
+		if (!is_set_ckpt_flags(sbi, CP_ERROR_FLAG))
 			f2fs_bug_on(sbi, 1);
 	}
 
@@ -803,6 +808,7 @@ void f2fs_handle_failed_inode(struct inode *inode)
 	} else {
 		set_inode_flag(inode, FI_FREE_NID);
 	}
+
 out:
 	f2fs_unlock_op(sbi);
 

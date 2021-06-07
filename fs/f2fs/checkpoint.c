@@ -120,6 +120,10 @@ retry:
 				++count <= DEFAULT_RETRY_IO_COUNT)
 			goto retry;
 		f2fs_stop_checkpoint(sbi, false);
+		f2fs_msg(sbi->sb, KERN_ERR,"f2fs readed meta page is not uptodate!");
+#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
+		f2fs_restart(); /* force restarting */
+#endif
 	}
 	return page;
 }
@@ -842,6 +846,7 @@ int f2fs_get_valid_checkpoint(struct f2fs_sb_info *sbi)
 	unsigned int cp_blks = 1 + __cp_payload(sbi);
 	block_t cp_blk_no;
 	int i;
+	int err;
 
 	sbi->ckpt = f2fs_kzalloc(sbi, array_size(blk_size, cp_blks),
 				 GFP_KERNEL);
@@ -869,6 +874,7 @@ int f2fs_get_valid_checkpoint(struct f2fs_sb_info *sbi)
 	} else if (cp2) {
 		cur_page = cp2;
 	} else {
+		err = -EFSCORRUPTED;
 		goto fail_no_cp;
 	}
 
@@ -881,8 +887,10 @@ int f2fs_get_valid_checkpoint(struct f2fs_sb_info *sbi)
 		sbi->cur_cp_pack = 2;
 
 	/* Sanity checking of checkpoint */
-	if (f2fs_sanity_check_ckpt(sbi))
+	if (f2fs_sanity_check_ckpt(sbi)) {
+		err = -EFSCORRUPTED;
 		goto free_fail_no_cp;
+	}
 
 	if (cp_blks <= 1)
 		goto done;
@@ -912,7 +920,7 @@ free_fail_no_cp:
 	f2fs_put_page(cp2, 1);
 fail_no_cp:
 	kvfree(sbi->ckpt);
-	return -EINVAL;
+	return err;
 }
 
 static void __add_dirty_inode(struct inode *inode, enum inode_type type)
@@ -1267,10 +1275,8 @@ static void update_ckpt_flags(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 
 	if (is_sbi_flag_set(sbi, SBI_QUOTA_SKIP_FLUSH))
 		__set_ckpt_flags(ckpt, CP_QUOTA_NEED_FSCK_FLAG);
-	/*
-	 * TODO: we count on fsck.f2fs to clear this flag until we figure out
-	 * missing cases which clear it incorrectly.
-	 */
+	else
+		__clear_ckpt_flags(ckpt, CP_QUOTA_NEED_FSCK_FLAG);
 
 	if (is_sbi_flag_set(sbi, SBI_QUOTA_NEED_REPAIR))
 		__set_ckpt_flags(ckpt, CP_QUOTA_NEED_FSCK_FLAG);
@@ -1319,7 +1325,12 @@ static void commit_checkpoint(struct f2fs_sb_info *sbi,
 	f2fs_submit_merged_write(sbi, META_FLUSH);
 }
 
+#ifdef CONFIG_F2FS_BD_STAT
+static int do_checkpoint(struct f2fs_sb_info *sbi,
+	struct cp_control *cpc, u64 *cp_flush_meta_time)
+#else
 static int do_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
+#endif
 {
 	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
 	struct f2fs_nm_info *nm_i = NM_I(sbi);
@@ -1333,9 +1344,18 @@ static int do_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 	struct curseg_info *seg_i = CURSEG_I(sbi, CURSEG_HOT_NODE);
 	u64 kbytes_written;
 	int err;
+#ifdef CONFIG_F2FS_BD_STAT
+	u64 cp_flush_meta_begin;
+#endif
 
 	/* Flush all the NAT/SIT pages */
+#ifdef CONFIG_F2FS_BD_STAT
+	cp_flush_meta_begin = local_clock();
+#endif
 	f2fs_sync_meta_pages(sbi, META, LONG_MAX, FS_CP_META_IO);
+#ifdef CONFIG_F2FS_BD_STAT
+	*cp_flush_meta_time += local_clock() - cp_flush_meta_begin;
+#endif
 	f2fs_bug_on(sbi, get_pages(sbi, F2FS_DIRTY_META) &&
 					!f2fs_cp_error(sbi));
 
@@ -1499,6 +1519,10 @@ int f2fs_write_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
 	unsigned long long ckpt_ver;
 	int err = 0;
+#ifdef CONFIG_F2FS_BD_STAT
+	u64 cp_begin = 0, cp_end, cp_submit_end = 0, discard_begin, discard_end;
+	u64 cp_flush_meta_time, cp_flush_meta_begin;
+#endif
 
 	if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED))) {
 		if (cpc->reason != CP_PAUSE)
@@ -1523,6 +1547,9 @@ int f2fs_write_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 
 	trace_f2fs_write_checkpoint(sbi->sb, cpc->reason, "start block_ops");
 
+#ifdef CONFIG_F2FS_BD_STAT
+	cp_begin = local_clock();
+#endif
 	err = block_operations(sbi);
 	if (err)
 		goto out;
@@ -1530,6 +1557,9 @@ int f2fs_write_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 	trace_f2fs_write_checkpoint(sbi->sb, cpc->reason, "finish block_ops");
 
 	f2fs_flush_merged_writes(sbi);
+#ifdef CONFIG_F2FS_BD_STAT
+	cp_submit_end = local_clock();
+#endif
 
 	/* this is the case of multiple fstrims without any changes */
 	if (cpc->reason & CP_DISCARD) {
@@ -1541,8 +1571,22 @@ int f2fs_write_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 		if (NM_I(sbi)->dirty_nat_cnt == 0 &&
 				SIT_I(sbi)->dirty_sentries == 0 &&
 				prefree_segments(sbi) == 0) {
+#ifdef CONFIG_F2FS_BD_STAT
+			cp_flush_meta_begin = local_clock();
+#endif
 			f2fs_flush_sit_entries(sbi, cpc);
+#ifdef CONFIG_F2FS_BD_STAT
+			discard_begin = local_clock();
+			cp_flush_meta_time = discard_begin - cp_flush_meta_begin;
+#endif
 			f2fs_clear_prefree_segments(sbi, cpc);
+#ifdef CONFIG_F2FS_BD_STAT
+			discard_end = local_clock();
+			bd_lock(sbi);
+			bd_max_val(sbi, max_cp_discard_time,
+				   discard_end - discard_begin);
+			bd_unlock(sbi);
+#endif
 			unblock_operations(sbi);
 			goto out;
 		}
@@ -1557,18 +1601,38 @@ int f2fs_write_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 	ckpt->checkpoint_ver = cpu_to_le64(++ckpt_ver);
 
 	/* write cached NAT/SIT entries to NAT/SIT area */
+#ifdef CONFIG_F2FS_BD_STAT
+	cp_flush_meta_begin = local_clock();
+#endif
 	err = f2fs_flush_nat_entries(sbi, cpc);
 	if (err)
 		goto stop;
 
 	f2fs_flush_sit_entries(sbi, cpc);
+#ifdef CONFIG_F2FS_BD_STAT
+	cp_flush_meta_time = local_clock() - cp_flush_meta_begin;
 
+	/* unlock all the fs_lock[] in do_checkpoint() */
+	err = do_checkpoint(sbi, cpc, &cp_flush_meta_time);
+	if (err)
+		f2fs_release_discard_addrs(sbi);
+	else {
+		discard_begin = local_clock();
+		f2fs_clear_prefree_segments(sbi, cpc);
+		discard_end = local_clock();
+		bd_lock(sbi);
+		bd_max_val(sbi, max_cp_discard_time,
+			   discard_end - discard_begin);
+		bd_unlock(sbi);
+	}
+#else
 	/* unlock all the fs_lock[] in do_checkpoint() */
 	err = do_checkpoint(sbi, cpc);
 	if (err)
 		f2fs_release_discard_addrs(sbi);
 	else
 		f2fs_clear_prefree_segments(sbi, cpc);
+#endif
 stop:
 	unblock_operations(sbi);
 	stat_inc_cp_count(sbi->stat_info);
@@ -1582,6 +1646,18 @@ stop:
 	trace_f2fs_write_checkpoint(sbi->sb, cpc->reason, "finish checkpoint");
 out:
 	mutex_unlock(&sbi->cp_mutex);
+	#ifdef CONFIG_F2FS_BD_STAT
+	if (!err && cp_begin) {
+		cp_end = local_clock();
+		bd_lock(sbi);
+		bd_inc_val(sbi, cp_success_count, 1);
+		bd_max_val(sbi, max_cp_submit_time, cp_submit_end - cp_begin);
+		bd_inc_val(sbi, cp_time, cp_end - cp_begin);
+		bd_max_val(sbi, max_cp_time, cp_end - cp_begin);
+		bd_max_val(sbi, max_cp_flush_meta_time, cp_flush_meta_time);
+		bd_unlock(sbi);
+	}
+#endif
 	return err;
 }
 

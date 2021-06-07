@@ -59,6 +59,8 @@ static int f2fs_vm_page_mkwrite(struct vm_fault *vmf)
 
 	f2fs_bug_on(sbi, f2fs_has_inline_data(inode));
 
+	f2fs_balance_fs(sbi, true);
+
 	file_update_time(vmf->vma->vm_file);
 	down_read(&F2FS_I(inode)->i_mmap_sem);
 	lock_page(page);
@@ -112,8 +114,6 @@ static int f2fs_vm_page_mkwrite(struct vm_fault *vmf)
 out_sem:
 	up_read(&F2FS_I(inode)->i_mmap_sem);
 
-	f2fs_balance_fs(sbi, dn.node_changed);
-
 	sb_end_pagefault(inode->i_sb);
 err:
 	return block_page_mkwrite_return(err);
@@ -123,6 +123,9 @@ static const struct vm_operations_struct f2fs_file_vm_ops = {
 	.fault		= f2fs_filemap_fault,
 	.map_pages	= filemap_map_pages,
 	.page_mkwrite	= f2fs_vm_page_mkwrite,
+#if defined(CONFIG_SPECULATIVE_PAGE_FAULT) && defined(CONFIG_MTK_PLATFORM)
+	.suitable_for_spf = true,
+#endif
 };
 
 static int get_parent_ino(struct inode *inode, nid_t *pino)
@@ -210,6 +213,12 @@ static int f2fs_do_sync_file(struct file *file, loff_t start, loff_t end,
 	};
 	unsigned int seq_id = 0;
 
+#ifdef CONFIG_F2FS_BD_STAT
+	u64 fsync_begin = 0, fsync_end = 0, wr_file_end, cp_begin = 0,
+	    cp_end = 0, sync_node_begin = 0, sync_node_end = 0,
+	    flush_begin = 0, flush_end = 0;
+#endif
+
 	if (unlikely(f2fs_readonly(inode->i_sb) ||
 				is_sbi_flag_set(sbi, SBI_CP_DISABLED)))
 		return 0;
@@ -219,11 +228,17 @@ static int f2fs_do_sync_file(struct file *file, loff_t start, loff_t end,
 	if (S_ISDIR(inode->i_mode))
 		goto go_write;
 
+#ifdef CONFIG_F2FS_BD_STAT
+	fsync_begin = local_clock();
+#endif
 	/* if fdatasync is triggered, let's do in-place-update */
 	if (datasync || get_dirty_pages(inode) <= SM_I(sbi)->min_fsync_blocks)
 		set_inode_flag(inode, FI_NEED_IPU);
 	ret = file_write_and_wait_range(file, start, end);
 	clear_inode_flag(inode, FI_NEED_IPU);
+#ifdef CONFIG_F2FS_BD_STAT
+	wr_file_end = local_clock();
+#endif
 
 	if (ret) {
 		trace_f2fs_sync_file_exit(inode, cp_reason, datasync, ret);
@@ -262,7 +277,13 @@ go_write:
 
 	if (cp_reason) {
 		/* all the dirty node pages should be flushed for POR */
+#ifdef CONFIG_F2FS_BD_STAT
+		cp_begin = local_clock();
+#endif
 		ret = f2fs_sync_fs(inode->i_sb, 1);
+#ifdef CONFIG_F2FS_BD_STAT
+		cp_end = local_clock();
+#endif
 
 		/*
 		 * We've secured consistency through sync_fs. Following pino
@@ -274,9 +295,15 @@ go_write:
 		goto out;
 	}
 sync_nodes:
+#ifdef CONFIG_F2FS_BD_STAT
+	sync_node_begin = local_clock();
+#endif
 	atomic_inc(&sbi->wb_sync_req[NODE]);
 	ret = f2fs_fsync_node_pages(sbi, inode, &wbc, atomic, &seq_id);
 	atomic_dec(&sbi->wb_sync_req[NODE]);
+#ifdef CONFIG_F2FS_BD_STAT
+	sync_node_end = local_clock();
+#endif
 	if (ret)
 		goto out;
 
@@ -310,8 +337,20 @@ sync_nodes:
 	f2fs_remove_ino_entry(sbi, ino, APPEND_INO);
 	clear_inode_flag(inode, FI_APPEND_WRITE);
 flush_out:
-	if (!atomic && F2FS_OPTION(sbi).fsync_mode != FSYNC_MODE_NOBARRIER)
+	/* VENDOR_EDIT yawnu@TECH.Storage.FS.oF2FS
+	 * 2019/09/13, fsync nobarrier protection
+	 */
+	if (!atomic && (F2FS_OPTION(sbi).fsync_mode != FSYNC_MODE_NOBARRIER ||
+							sbi->fsync_protect)) {
+	//if (!atomic && F2FS_OPTION(sbi).fsync_mode != FSYNC_MODE_NOBARRIER) {
+#ifdef CONFIG_F2FS_BD_STAT
+		flush_begin = local_clock();
+#endif
 		ret = f2fs_issue_flush(sbi, inode->i_ino);
+#ifdef CONFIG_F2FS_BD_STAT
+		flush_end = local_clock();
+#endif
+	}
 	if (!ret) {
 		f2fs_remove_ino_entry(sbi, ino, UPDATE_INO);
 		clear_inode_flag(inode, FI_UPDATE_WRITE);
@@ -321,6 +360,31 @@ flush_out:
 out:
 	trace_f2fs_sync_file_exit(inode, cp_reason, datasync, ret);
 	f2fs_trace_ios(NULL, 1);
+#ifdef CONFIG_F2FS_BD_STAT
+	if (!ret && fsync_begin) {
+		fsync_end = local_clock();
+		bd_lock(sbi);
+		if (S_ISREG(inode->i_mode))
+			bd_inc_val(sbi, fsync_reg_file_count, 1);
+		else if (S_ISDIR(inode->i_mode))
+			bd_inc_val(sbi, fsync_dir_count, 1);
+		bd_inc_val(sbi, fsync_time, fsync_end - fsync_begin);
+		bd_max_val(sbi, max_fsync_time, fsync_end - fsync_begin);
+		bd_inc_val(sbi, fsync_wr_file_time, wr_file_end - fsync_begin);
+		bd_max_val(sbi, max_fsync_wr_file_time, wr_file_end - fsync_begin);
+		bd_inc_val(sbi, fsync_cp_time, cp_end - cp_begin);
+		bd_max_val(sbi, max_fsync_cp_time, cp_end - cp_begin);
+		if (sync_node_end) {
+			bd_inc_val(sbi, fsync_sync_node_time,
+				   sync_node_end - sync_node_begin);
+			bd_max_val(sbi, max_fsync_sync_node_time,
+				   sync_node_end - sync_node_begin);
+		}
+		bd_inc_val(sbi, fsync_flush_time, flush_end - flush_begin);
+		bd_max_val(sbi, max_fsync_flush_time, flush_end - flush_begin);
+		bd_unlock(sbi);
+	}
+#endif
 	return ret;
 }
 
@@ -582,7 +646,7 @@ truncate_out:
 	zero_user(page, offset, PAGE_SIZE - offset);
 
 	/* An encrypted inode should have a key and truncate the last page. */
-	f2fs_bug_on(F2FS_I_SB(inode), cache_only && f2fs_encrypted_inode(inode));
+	f2fs_bug_on(F2FS_I_SB(inode), cache_only && IS_ENCRYPTED(inode));
 	if (!cache_only)
 		set_page_dirty(page);
 	f2fs_put_page(page, 1);
@@ -709,7 +773,7 @@ int f2fs_getattr(const struct path *path, struct kstat *stat,
 		stat->attributes |= STATX_ATTR_APPEND;
 	if (flags & F2FS_COMPR_FL)
 		stat->attributes |= STATX_ATTR_COMPRESSED;
-	if (f2fs_encrypted_inode(inode))
+	if (IS_ENCRYPTED(inode))
 		stat->attributes |= STATX_ATTR_ENCRYPTED;
 	if (flags & F2FS_IMMUTABLE_FL)
 		stat->attributes |= STATX_ATTR_IMMUTABLE;
@@ -1558,7 +1622,7 @@ static long f2fs_fallocate(struct file *file, int mode,
 	if (!S_ISREG(inode->i_mode))
 		return -EINVAL;
 
-	if (f2fs_encrypted_inode(inode) &&
+	if (IS_ENCRYPTED(inode) &&
 		(mode & (FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE)))
 		return -EOPNOTSUPP;
 
@@ -1642,7 +1706,7 @@ static int f2fs_ioc_getflags(struct file *filp, unsigned long arg)
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	unsigned int flags = fi->i_flags;
 
-	if (f2fs_encrypted_inode(inode))
+	if (IS_ENCRYPTED(inode))
 		flags |= F2FS_ENCRYPT_FL;
 	if (f2fs_has_inline_data(inode) || f2fs_has_inline_dentry(inode))
 		flags |= F2FS_INLINE_DATA_FL;
@@ -1766,6 +1830,7 @@ static int f2fs_ioc_start_atomic_write(struct file *filp)
 	spin_lock(&sbi->inode_lock[ATOMIC_FILE]);
 	if (list_empty(&fi->inmem_ilist))
 		list_add_tail(&fi->inmem_ilist, &sbi->inode_list[ATOMIC_FILE]);
+	sbi->atomic_files++;
 	spin_unlock(&sbi->inode_lock[ATOMIC_FILE]);
 
 	/* add inode in inmem_list first and set atomic_file */
@@ -2421,7 +2486,7 @@ static int f2fs_move_file_range(struct file *file_in, loff_t pos_in,
 	if (!S_ISREG(src->i_mode) || !S_ISREG(dst->i_mode))
 		return -EINVAL;
 
-	if (f2fs_encrypted_inode(src) || f2fs_encrypted_inode(dst))
+	if (IS_ENCRYPTED(src) || IS_ENCRYPTED(dst))
 		return -EOPNOTSUPP;
 
 	if (src == dst) {

@@ -617,7 +617,11 @@ static inline int utilization(struct f2fs_sb_info *sbi)
  * F2FS_IPUT_DISABLE - disable IPU. (=default option)
  */
 #define DEF_MIN_IPU_UTIL	70
-#define DEF_MIN_FSYNC_BLOCKS	8
+/* VENDOR_EDIT yanwu@TECH.Storage.FS.oF2FS
+ * 2019/08/12, enlarge min_fsync_blocks to optimize performance
+ */
+#define DEF_MIN_FSYNC_BLOCKS	20
+//#define DEF_MIN_FSYNC_BLOCKS	8
 #define DEF_MIN_HOT_BLOCKS	16
 
 #define SMALL_VOLUME_SEGMENTS	(16 * 512)	/* 16GB */
@@ -672,7 +676,6 @@ static inline void verify_block_addr(struct f2fs_io_info *fio, block_t blk_addr)
 static inline int check_block_count(struct f2fs_sb_info *sbi,
 		int segno, struct f2fs_sit_entry *raw_sit)
 {
-#ifdef CONFIG_F2FS_CHECK_FS
 	bool is_valid  = test_bit_le(0, raw_sit->valid_map) ? true : false;
 	int valid_blocks = 0;
 	int cur_pos = 0, next_pos;
@@ -697,9 +700,9 @@ static inline int check_block_count(struct f2fs_sb_info *sbi,
 				"Mismatch valid blocks %d vs. %d",
 					GET_SIT_VBLOCKS(raw_sit), valid_blocks);
 		set_sbi_flag(sbi, SBI_NEED_FSCK);
-		return -EINVAL;
+		return -EFSCORRUPTED;
 	}
-#endif
+
 	/* check segment usage, and check boundary of a given segment number */
 	if (unlikely(GET_SIT_VBLOCKS(raw_sit) > sbi->blocks_per_seg
 					|| segno > TOTAL_SEGS(sbi) - 1)) {
@@ -707,7 +710,7 @@ static inline int check_block_count(struct f2fs_sb_info *sbi,
 				"Wrong valid blocks %d or segno %u",
 					GET_SIT_VBLOCKS(raw_sit), segno);
 		set_sbi_flag(sbi, SBI_NEED_FSCK);
-		return -EINVAL;
+		return -EFSCORRUPTED;
 	}
 	return 0;
 }
@@ -869,5 +872,20 @@ static inline void wake_up_discard_thread(struct f2fs_sb_info *sbi, bool force)
 		return;
 wake_up:
 	dcc->discard_wake = 1;
+	wake_up_interruptible_all(&dcc->discard_wait_queue);
+}
+
+/* VENDOR_EDIT huangjianan@TECH.Storage.FS
+* 2020-1-14, add for oDiscard decoupling
+*/
+static inline void wake_up_discard_thread_aggressive(struct f2fs_sb_info *sbi,
+						     int policy)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!sbi->dc_opt_enable)
+		return;
+
+	dcc->discard_wake = policy;
 	wake_up_interruptible_all(&dcc->discard_wait_queue);
 }
